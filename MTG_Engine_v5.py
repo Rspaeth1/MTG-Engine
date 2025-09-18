@@ -9,15 +9,6 @@ from enum import Enum, auto
 # --- ENUMS ---
 # ==============================================================================
 
-class Types(Enum):
-    pass
-
-class Subtypes(Enum):
-    pass
-
-class Supertypes(Enum):
-    pass
-
 class Zone(Enum):
     HAND, COMMAND, GRAVEYARD, LIBRARY, EXILE, STACK, BATTLEFIELD, LIMBO = auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto()
 
@@ -28,13 +19,22 @@ class TurnStep(Enum):
     UNTAP, UPKEEP, DRAW, MAIN, BEGINNING_OF_COMBAT, DECLARE_ATTACKERS, DECLARE_BLOCKERS, FIRST_STRIKE_DAMAGE, COMBAT_DAMAGE, END_OF_COMBAT, END, CLEANUP = auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto()
 
 class TriggerType(Enum):
-    DAMAGE_DEALT, ENTERS_THE_BATTLEFIELD, DIES, ZONE_CHANGE, DESTROYED, SACRIFICED = auto(), auto(), auto(), auto(), auto(), auto()
+    DAMAGE_DEALT, ENTERS_THE_BATTLEFIELD, DIES, ZONE_CHANGE, DESTROYED, SACRIFICED, DRAW_CARD, UNTAP = auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto()
+
+class ReplacementType(Enum):
+    QUANTITY_MODIFICATION, ZONE_REDIRECT, SKIP = auto(), auto(), auto()
+
+class CheckCondition(Enum):
+    COLOR, TYPE = auto(), auto()
 
 class SBAType(Enum):
     CHECK_PLAYER_LIFE, CHECK_LETHAL_DAMAGE, LEGEND_RULE, CHECK_COMMANDER_DAMAGE = auto(), auto(), auto(), auto()
 
 class ActionType(Enum):
     PLAY_LAND, CAST_SPELL, ACTIVATE_ABILITY, PASS_PRIORITY, CAST_FROM_COMMAND_ZONE = auto(), auto(), auto(), auto(), auto()
+
+class Speed(Enum):
+    SORCERY, INSTANT = auto(), auto()
 
 class Layer(Enum):
     COPY_EFFECTS = 1
@@ -66,6 +66,43 @@ def parse_mana_cost(cost_string: str) -> Dict[str, int]:
         elif s in cost: cost[s] += 1
     return {k: v for k, v in cost.items() if v > 0}
 
+def change_zone(card: 'Card', new_zone: Zone, index: int, new_controller: 'Player') -> Zone:
+    old_zone = card.zone
+    controller = card.controller
+
+    if old_zone == new_zone:
+        return None
+
+    if old_zone == Zone.COMMAND:
+        controller.command_zone.remove(card)
+    elif old_zone == Zone.EXILE:
+        controller.exile.remove(card)
+    elif old_zone == Zone.GRAVEYARD:
+        controller.graveyard.remove(card)
+    elif old_zone == Zone.HAND:
+        controller.hand.remove(card)
+    elif old_zone == Zone.LIBRARY:
+        controller.library.remove(card)
+    
+    if new_zone == Zone.COMMAND:
+        new_controller.command_zone.insert(index, card)
+    elif new_zone == Zone.EXILE:
+        new_controller.exile.insert(index, card)
+    elif new_zone == Zone.GRAVEYARD:
+        new_controller.graveyard.insert(index, card)
+    elif new_zone == Zone.HAND:
+        new_controller.hand.insert(index, card)
+    elif new_zone == Zone.LIBRARY:
+        new_controller.library.insert(index, card)
+
+def condition_check(card: 'Card', condition: CheckCondition, checks: Set[Any]):
+        match condition:
+            case CheckCondition.COLOR:
+                return checks.isdisjoint(set(card.colorIdentity))
+            case CheckCondition.TYPE:
+                return any(checks.isdisjoint(set(card.types)), checks.isdisjoint(set(card.subtypes)), checks.isdisjoint(set(card.supertypes)))
+
+
 # ==============================================================================
 # --- DECK LOADING ---
 # ==============================================================================
@@ -87,81 +124,147 @@ class DeckLoader:
         self._legalities_path = legalities_path # Stored for use in load_deck
         self._banned_uuids: Set[str] = set()
 
+    def _clean_name(self, raw: str) -> str:
+        # Precompiled patterns for trailing junk
+        SETCODE_RE   = re.compile(r'\s*[A-Z]{2,6}[- ]?\d+[a-z]?\s*$', re.ASCII)  # e.g., "KTK-34", "MH1 164", "58p"
+        PARENS_RE    = re.compile(r'\s*\([^)]*\)\s*$', re.ASCII)                 # e.g., "(PLST)", "(NEO)", "(6ED)"
+        STAR_TAG_RE  = re.compile(r'\s*\*[^*]*\*\s*$', re.ASCII)                 # e.g., "*F*", "*Foil*"
+        NUMBER_RE    = re.compile(r'\s*\d+[a-z]?\s*$', re.ASCII)                 # e.g., "15", or "58p" if no set code present
 
-    def _read_decklist(self, filepath: str) -> List[str]:
-        with open(filepath, 'r') as f: lines = [line.strip() for line in f if line.strip()]
-        return [re.sub(r'^\d+\s*x?\s*', '', line, flags=re.IGNORECASE) for line in lines]
+        name = raw.strip()
+        # Iteratively strip trailing tokens until nothing more matches
+        changed = True
+        while changed:
+            changed = False
+            for pat in (STAR_TAG_RE, SETCODE_RE, NUMBER_RE, PARENS_RE):
+                new = pat.sub('', name)
+                if new != name:
+                    name = new.strip()
+                    changed = True
+        return name
 
-    def _fetch_card_data(self, names: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _read_decklist(self, filepath: str) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        commander_name = ""
+        first_pass = True # To keep track of first line (commander)
+
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+
+                # Quantity (handles "4", "4x", "4 x"); default to 1 if missing
+                m = re.match(r'^\s*(\d+)\s*x?\s*(.+)$', s, flags=re.IGNORECASE)
+                if m:
+                    qty, rest = int(m.group(1)), m.group(2)
+                else:
+                    qty, rest = 1, s
+
+                name = self._clean_name(rest)
+                if not name:
+                    continue
+
+                # Grab commander name
+                if first_pass:
+                    commander_name = name
+                    first_pass = False
+
+                counts[name] = counts.get(name, 0) + qty
+
+        
+        return commander_name, counts
+
+    def _fetch_card_data(self, decklist: Dict[str, int]):
         """Retrieves data for all faces of a specific list of card names."""
+        names = decklist.keys()
 
         chunk_iter_a = pd.read_csv(self._cards_path, chunksize=5000, low_memory=True)
-        front_faces_df = pd.concat(
+        all_cards_df = pd.concat(
             [chunk[chunk['name'].isin(names)] for chunk in chunk_iter_a]
         )
-        other_face_uuids = set()
-        if 'otherFaceIds' in front_faces_df.columns:
-            for face_ids in front_faces_df['otherFaceIds'].dropna():
-                for uuid_str in str(face_ids).split(','):
-                    if uuid_str: other_face_uuids.add(uuid_str)
-        all_card_data_df = front_faces_df
-        if other_face_uuids:
-            chunk_iter_b = pd.read_csv(self._cards_path, chunksize=5000, low_memory=True)
-            back_faces_df = pd.concat(
-                [chunk[chunk['uuid'].isin(other_face_uuids)] for chunk in chunk_iter_b]
-            )
-            all_card_data_df = pd.concat([front_faces_df, back_faces_df]).drop_duplicates(subset=['uuid'])
-        return {row['uuid']: row for row in all_card_data_df.to_dict('records')}
+
+        # There may be a more efficient way to do this... but the cards db is precleaned except for some DFCs, this grabs only the first 2 occurrences
+        all_cards_df = all_cards_df[
+            (all_cards_df.groupby("name").cumcount() < 2)
+            & ((all_cards_df["otherFaceIds"].notna())
+            | (all_cards_df["otherFaceIds"] != ""))
+        ]
+
+        # Now duplicate cards that need it
+        for name, count in decklist.items():
+            if count > 1:
+                row = all_cards_df.loc[(all_cards_df["name"] == name) 
+                    & ((all_cards_df["otherFaceIds"].isna())
+                    | (all_cards_df["otherFaceIds"] == "")) # Ignore DFCs for now (if adding other gamemodes where duplicates are allowed, would need a more sophisticated implementation)
+                ].head(1).copy()
+
+                if row.empty: continue # If nothing, continue
+
+                dupes = pd.concat([row] * (count - 1), ignore_index=True) # Create duplicates
+                all_cards_df = pd.concat([all_cards_df, dupes], ignore_index=True) # Concat
+
+        # Check if we could find all cards
+        for name in names:
+            if not name in all_cards_df['name'].values:
+                print(f"Error: Couldn't find card {name}")
+
+        return all_cards_df
 
     def load_deck(self, filepath: str) -> Optional['Deck']:
         print(f"\n--- Loading deck: {filepath} ---")
-        card_names_from_file = self._read_decklist(filepath)
+        commander_name, decklist = self._read_decklist(filepath)
 
-        # First validation step
-        if len(card_names_from_file) != 100:
-            print("Error: Deck must have 100 cards.")
-            return None
+        if commander_name == "":
+            return "Error getting commander name."
 
         # Fetch all required card data first
-        all_faces_data_map = self._fetch_card_data(list(set(card_names_from_file)))
-        print(all_faces_data_map)
-        if not all_faces_data_map: return None
+        all_faces_df = self._fetch_card_data(decklist)
 
         # Create a Card object for every face, keyed by UUID
-        card_objects_by_uuid = {uuid: Card(data) for uuid, data in all_faces_data_map.items()}
+        all_faces = [Card(row._asdict()) for row in all_faces_df.itertuples(index=False)]
 
-        # Link the double-faced cards together
-        for card_obj in card_objects_by_uuid.values():
-            if card_obj.otherFaceIds:
-                other_face_uuid = card_obj.otherFaceIds[0]
-                if other_face_uuid in card_objects_by_uuid:
-                    card_obj.otherFace = card_objects_by_uuid[other_face_uuid]
-                    card_obj.side = card_obj.side or 'a'
-                    card_obj.otherFace.side = 'b'
+        # Find commander
+        commander = None
+        for card in all_faces:
+            if card.name == commander_name:
+                commander = card
+                break
 
-        # --- DECK ASSEMBLY LOGIC ---
-        # Create a temporary name-to-uuid map from the cards we just fetched.
-        name_to_uuid_map = {card.name.lower(): card.uuid for card in card_objects_by_uuid.values()}
+        # Build the final list of cards
+        deck = []
+        seen = {}
 
-        # Build the final list of cards in the order they appeared in the file.
-        final_deck_cards = []
-        for name in card_names_from_file:
-            uuid = name_to_uuid_map.get(name.lower())
-            if uuid and uuid in card_objects_by_uuid:
-                final_deck_cards.append(card_objects_by_uuid[uuid])
+        deck.append(commander) # Put commander first
+        all_faces.remove(commander)
+
+        for card in all_faces:
+            if not card.is_dfc:
+                deck.append(card)
+            elif card.name not in seen: # again, this is pretty commander specific, other gamemodes would require more robust system
+                deck.append(card)
+                seen[card.name] = card
+            else:
+                seen_card = seen[card.name]
+                old_spot = deck.index(seen_card)
+
+                if seen_card.side == 'a':
+                    deck[old_spot].otherFace = card
+                else:
+                    deck[old_spot] = card
+                    card.otherFace = seen_card
         
         # Check for missing cards (e.g., typos in decklist)
-        if len(final_deck_cards) != 100:
-            print(f"Error: Found {len(final_deck_cards)} valid cards, but 100 are required.")
+        if len(deck) != 100:
+            print(f"Error: Found {len(deck)} valid cards, but 100 are required.")
             return None
 
         # --- Validation Logic ---
-        commander = final_deck_cards[0]
-        library = final_deck_cards[1:]
+        commander = deck[0]
+        library = deck[1:]
 
-        if "Legendary" not in commander.supertypes or "Creature" not in commander.types:
-            print(f"Validation Error: Commander '{commander.name}' is not a Legendary Creature.")
-            return None
+        if not commander.can_be_commander:
+            print(f"Validation Error: Card '{commander.name}' is an invalid commander.")
         
         commander_identity = set(commander.colorIdentity)
         seen = [commander]
@@ -171,10 +274,11 @@ class DeckLoader:
                 print(f"Validation Error: Card '{card.name}' is outside the commander's color identity.")
                 return None
             
+            # Commander cards uniqueness check
             if card in seen and not card.is_basic_land:
                 print(f"Validation Error: Card '{card}' is in the deck more than once.")
             else:
-                seen.apppend(card)
+                seen.append(card)
 
         
         print(f"Deck '{filepath}' loaded and validated successfully.")
@@ -231,7 +335,9 @@ class manaPool:
 class Player:
     def __init__(self, name: str, deck: Deck):
         self.name = name
+        self.alive = True
         self.life = 40
+        self.max_hand_size = 7
         self.hand: List['Card'] = []
         self.library: List['Card'] = []
         self.graveyard: List['Card'] = []
@@ -242,29 +348,61 @@ class Player:
         self.commander_cast_count = 0
         self.commander_damage: Dict[str, int] = {}
         self.land_played_this_turn = False
-        self.mana_pool = manaPool()
-        
         self.deck = deck
+        self.mana_pool = manaPool()
+
         self.commander = deck.commander
         self.library = deck.library
         self.index: int = -1
         self.mulligan_count: int = 0
-        
+        self.cards_drawn_this_turn = 0
+
+        self.command_zone.append(self.commander)
+
     def shuffle_library(self):
         random.shuffle(self.library)
+        print(f"{self.name} shuffles their library.")
 
-    def draw_cards(self, num: int):
+    def draw_cards(self, num: int, first: bool):
         for _ in range(num):
             if self.library:
-                card = self.library.pop(0)
-                card.zone = Zone.HAND
-                self.hand.append()
-    
-    def return_hand_to_library(self):
-        """Shuffles the player's hand back into their library."""
-        self.library.extend(self.hand)
-        self.hand.clear()
+                card = self.library[-1]
+                change_zone(card,Zone.HAND,-1,self) # Change zone
+                self.cards_drawn_this_turn += 1 # Make sure to reset this after the turn
+            else:
+                # No need for SBA check here, if we go to draw and there are no cards, just kill player
+                pass
+        print(f"{self.name} draws {num} cards.")
+
+    def discard_card(self, cards: List['Card']):
+        for card in cards:
+            change_zone(card, Zone.GRAVEYARD, -1, self) # Change zone, handle triggers/replacement there
+        print(f"{self.name} discards {len(cards)} cards.")
+
+    def mulligan(self, multiplayer: bool = True):
+        print(f"{self.name} mulligans down to {new_hand_size}.")
+        self.put_cards_on_top(self.hand)
         self.shuffle_library()
+        self.mulligan_count += 1
+
+        new_hand_size = self.max_hand_size - max(self.mulligan_count-1,0) if multiplayer else self.max_hand_size-self.mulligan_count # Give everyone a free mulligan if in multiplayer game
+        self.draw_cards(new_hand_size)
+        self._prompt_mulligan(new_hand_size)
+
+    def put_cards_on_top(self, cards: List['Card']):
+        for card in cards:
+            change_zone(card, Zone.LIBRARY, -1, self)
+        print(f"{self.name} puts {len(cards)} card{'s' if len(cards) != 1 else ''} on the top of their library.")
+    
+    def put_cards_on_bottom(self, cards: List['Card']):
+        for card in cards:
+            change_zone(card, Zone.LIBRARY, 0, self)
+        print(f"{self.name} puts {len(cards)} card{'s' if len(cards) != 1 else ''} on the bottom of their library.")
+
+    def get_decision(self, prompt: str, options: List[Any]) -> Any:
+        print(f"  [DECISION] {self.name}: {prompt} {options}")
+        if not options: return None
+        return options[0] # Placeholder
     
     def can_pay_cost(self, cost: Dict[str, int]) -> bool:
         mana_pool = self.mana_pool.pool
@@ -273,7 +411,7 @@ class Player:
                 return False
         return True
     
-    def pay_cost(self, cost: Dict[str, int]):
+    def _pay_cost(self, cost: Dict[str, int]):
         mana_pool = self.mana_pool.pool
         for color, amount in cost.items():
             if color != "generic":
@@ -281,6 +419,14 @@ class Player:
             elif amount > 0:
                 # GET INPUT FROM PLAYER ON HOW TO PAY FOR GENERIC COSTS    
                 pass
+    
+    def _prompt_mulligan(self, new_hand_size: int = 7):
+        decision = self.get_decision(f"Do you keep this hand?",  ['Keep', 'Mulligan'])
+        if decision == 'Mulligan':
+            self.mulligan()
+        elif new_hand_size < self.max_hand_size:
+            decision = self.get_decision(f"Which {self.max_hand_size-new_hand_size} card{'s' if self.max_hand_size-new_hand_size != 1 else ''} do you want to put on bottom?", [card.name for card in self.hand])
+            self.put_cards_on_bottom(decision) # Needs revision
 
 class Stack:
     def __init__(self):
@@ -301,6 +447,9 @@ class Stack:
 
     def is_empty(self) -> bool:
         return not self._stack
+    
+class ReplacementEffect:
+    def __init__(self, event: GameEvent)
 
 class GameEvent:
     def __init__(self, event_type: TriggerType, **data):
@@ -308,7 +457,7 @@ class GameEvent:
         self.data = data
         self.is_replaced = False
 
-class ReplacementEffect:
+class ReplacementEffect_______OLD:
     def __init__(self, original_event: TriggerType, new_event_type: TriggerType, conditions: List[Callable], description: str):
         self.original_event_type = original_event
         self.new_event_type = new_event_type
@@ -416,7 +565,6 @@ class GameObject:
         return hash(self.uuid)
 
 class Card(GameObject):
-    """Represents the printed, immutable data of a Magic card, now with DFC support."""
     def __init__(self, card_data: Dict[str, Any]):
         #super().__init__(card_data.get('uuid')) # If we want to use the pregenerated UUIDs
         super().__init__()
@@ -443,6 +591,8 @@ class Card(GameObject):
         self.loyalty: str = str(card_data.get('loyalty', ''))
         self.otherFaceIds: List[str] = split_csv_string(card_data.get('otherFaceIds', ''))
         self.zone = Zone.LIBRARY
+        self.speed = Speed.INSTANT if 'Instant' in self.types or 'Flash' in self.keywords else Speed.SORCERY
+        
 
         # --- Boolean Attributes ---
         self.can_be_commander = bool(card_data.get('commander',0))
@@ -494,50 +644,17 @@ class Characteristics:
         self.keywords = set(permanent.source_card.keywords)
         self.types = set(permanent.source_card.types)
 
-class Permanent(GameObject):
-    def __init__(self, source_card: Card, game_state: 'GameState'):
+class Permanent(Card):
+    def __init__(self, source_card: Card):
         super().__init__()
         self.source_card = source_card
-        self._game_state = game_state
+        self.__dict__.update(vars(source_card)) # Gives this permanent all attributes of the source card
+
         self.damage_marked: int = 0
         self.tapped: bool = False
+        self.untaps_in_untap: bool = True
+        self.untappable: bool = True
         self.has_summoning_sickness: bool = "Creature" in self.source_card.types
-
-    @property
-    def name(self) -> str:
-        return self.source_card.name
-
-    @property
-    def power(self) -> int:
-        return self._game_state.get_characteristics(self).power
-    
-    @property
-    def toughness(self) -> int:
-        return self._game_state.get_characteristics(self).toughness
-
-    @property
-    def keywords(self) -> Set[str]:
-        return self._game_state.get_characteristics(self).keywords
-
-    @property
-    def types(self) -> Set[str]:
-        return self._game_state.get_characteristics(self).types
-
-    def __repr__(self):
-        base = f"{self.name}"
-        if "Creature" in self.types:
-            base += f" ({self.power}/{self.toughness})"
-        if self.tapped: base += " (Tapped)"
-        return base
-
-class Stackable(GameObject):
-    def __init__(self, source):
-        super().__init__()
-        self.source = source
-    def resolve(self, game_state: 'GameState'):
-        raise NotImplementedError
-    def __repr__(self):
-        return f"{self.__class__.__name__}(source={self.source.name})"
 
 class Ability(GameObject):
     def __init__(self, source, description: str, effect: Callable):
@@ -559,17 +676,19 @@ class TriggeredAbility(Ability):
     pass
     
 
-class Spell(Stackable):
-    def __init__(self, source_card: Card, cast_from_zone: Zone):
-        super().__init__(source_card)
+class Spell(Card):
+    def __init__(self, source_card: Card, cast_from_zone: Zone, targets: List[Any] = []):
+        super().__init__()
         self.cast_from_zone = cast_from_zone
+        self.__dict__.update(vars(source_card)) # Gives this spell all attributes of the source card
+        self.targets = targets
     
     @property
     def source_card(self) -> Card:
         return self.source
 
     def resolve(self, game_state: 'GameState'):
-        print(f"  [STACK] Resolving spell: {self.source_card.name} (cast from {self.cast_from_zone.name})")
+        print(f"  [STACK] Resolving spell: {self.name} (cast from {self.cast_from_zone.name})")
         is_permanent = any(t in self.source_card.types for t in ["Creature", "Artifact", "Enchantment", "Planeswalker", "Land"])
         if is_permanent:
             new_permanent = game_state.create_permanent_from_card(self.source_card, self.controller)
@@ -622,6 +741,7 @@ class InputHandler:
 class GameState:
     def __init__(self, players: List[Player]):
         self.players = players
+        self.num_players = len(players)
         self.active_player_index = 0
         self.current_phase: Optional[TurnPhase] = None
         self.current_step: Optional[TurnStep] = None
@@ -632,66 +752,145 @@ class GameState:
         self.event_manager = EventManager(self)
         self.pending_triggers: List[TriggeredAbility] = []
         self.active_modifiers: List[Modifier] = []
+        self.current_turn = 0
 
     def setup_game(self):
         print("\n--- Setting up game ---")
         
         # 1. Randomly determine turn order
-        random.shuffle(self.players)
         print("Randomizing turn order...")
-        for i, player in enumerate(self.players):
-            player.index = i
-            print(f"  Turn {i+1}: {player.name}")
+        self._set_turn_order()
+
 
         # 2. Players shuffle their libraries and draw opening hands
-        for player in self.players:
-            player.shuffle_library()
-            player.draw_cards(7)
-            print(f"{player.name} shuffles their library and draws their opening hand.")
+        self._loop_priority([ [Player.shuffle_library], [Player.draw_cards, {'num': 7}] ])
+            
 
         # 3. Handle the mulligan process
-        self._handle_mulligans()
+        self._loop_priority([ [Player._prompt_mulligan, {}] ])
 
         # 4. Handle pre-game actions
         # placeholder for now
             
-        print("--- Game setup complete ---\n")
+        print("\n--- Game setup complete ---\n")
 
-    def _handle_mulligans(self):
-        """Manages the London mulligan process for all players."""
-        # Phase 1: Each player decides whether to keep or mulligan.
-        for player in self.players:
-            while True:
-                prompt = f"{player.name}, do you keep this hand of {len(player.hand)}?"
-                # In a real game, this would show the hand.
-                choice = InputHandler.get_decision(player, prompt, ["Keep", "Mulligan"])
-                
-                if choice == "Keep":
-                    break
-                
-                # Player chose to mulligan
-                player.mulligan_count += 1
-                print(f"  [MULLIGAN] {player.name} mulligans to {7 - player.mulligan_count + 1}.")
-                player.return_hand_to_library()
-                player.draw_cards(7)
-                
-                if len(player.hand) == 0: # Cannot mulligan a hand of 0
-                    break
+    def game_loop(self):
+        while True:
+            self.current_turn += 1
+            turn_num = self.current_turn
 
-        # Phase 2: Players who mulliganed now put cards on the bottom of their library.
-        print("--- Resolving Mulligans ---")
-        for player in self.players:
-            if player.mulligan_count - 1 > 0:
-                num_to_bottom = player.mulligan_count - 1
-                prompt = f"{player.name}, choose {num_to_bottom} card(s) to put on the bottom of your library."
-                
-                for i in range(num_to_bottom):
-                    card_to_bottom = InputHandler.get_decision(player, f"{prompt} ({num_to_bottom - i} remaining)", player.hand)
-                    if card_to_bottom:
-                        player.hand.remove(card_to_bottom)
-                        player.library.append(card_to_bottom) # Add to the bottom
-                        print(f"  [MULLIGAN] {player.name} puts a card on the bottom. Hand size: {len(player.hand)}")
+            print(f"\n--- Turn {turn_num} ---\n")
 
+            self._loop_priority([ [self._take_turn, {}]  ])
+            
+
+            break # Placeholder ------------------------
+
+    def _take_turn(self, player: Player):
+        if not player.alive:
+            return
+        
+        phases = [TurnPhase.BEGINNING, TurnPhase.PRECOMBAT_MAIN, TurnPhase.COMBAT, TurnPhase.POSTCOMBAT_MAIN, TurnPhase.ENDING] # Making this a list to make it more flexible for things such as adding more phases
+        steps = {
+            TurnPhase.BEGINNING: [TurnStep.UNTAP, TurnStep.UPKEEP, TurnStep.DRAW],
+            TurnPhase.PRECOMBAT_MAIN: [TurnStep.MAIN],
+            TurnPhase.COMBAT: [TurnStep.BEGINNING_OF_COMBAT, TurnStep.DECLARE_ATTACKERS, TurnStep.DECLARE_BLOCKERS, TurnStep.FIRST_STRIKE_DAMAGE, TurnStep.COMBAT_DAMAGE, TurnStep.END_OF_COMBAT],
+            TurnPhase.POSTCOMBAT_MAIN: [TurnStep.MAIN], 
+            TurnPhase.ENDING: [TurnStep.END, TurnStep.CLEANUP]
+        }
+
+        
+        phase_num = 0
+        while phase_num < len(phases):
+            self.current_phase = phases[phase_num] # Set phase
+            step_num = 0
+
+            # 1. Advance step
+            while step_num < len(steps[self.current_phase]):
+                self.current_step = steps[self.current_phase][step_num] # Set step
+
+                # 2. Turn-Based Actions
+                self._turn_based_actions(player)
+
+                # 3. Check for begginning of step triggers
+                # Post begginning of step trigger
+
+                # 4. Players receive priority
+                #If we are in untap, first strike, combat damage, or cleanup, no priority is received
+                if self.current_step not in [TurnStep.UNTAP, TurnStep.FIRST_STRIKE_DAMAGE, TurnStep.COMBAT_DAMAGE, TurnStep.CLEANUP]:
+                    #self._loop_priority([[]]) --- get decision based on legal actions
+                    pass
+
+                # 5. Check for end of step triggers
+                # Post end of step trigger
+
+                # Go to next step
+                step_num += 1
+            
+            # Go to next phase
+            phase_num += 1
+            
+    def _turn_based_actions(self, player):
+        step = self.current_step
+
+        match step: # These are the only steps where TBAs take place
+            case TurnStep.UNTAP:
+                # modify this to post an event to possibly replace the untapping with something (i.e., winter orb)
+                self.untap(player.battlefield)
+            case TurnStep.DRAW:
+                player.draw_cards(1)
+            case TurnStep.DECLARE_ATTACKERS:
+                # Active player declares attackers
+                pass
+            case TurnStep.DECLARE_BLOCKERS:
+                # Players being attacked declare blockers
+                pass
+            case TurnStep.FIRST_STRIKE_DAMAGE:
+                # Deal first strike damage
+                pass
+            case TurnStep.COMBAT_DAMAGE:
+                # Deal combat damage
+                pass
+            case TurnStep.CLEANUP:
+                if len(player.hand) > player.max_hand_size:
+                    # Prompt player to choose cards to discard
+                    pass
+                # Remove all damage marked on permanents
+                # End until end of turn effects
+
+    def untap(self, permanents: List['Permanent']):
+        for permanent in permanents:
+            # Check if we can untap
+            if (self.current_step == TurnStep.UNTAP and permanent.untaps_in_untap and permanent.untappable) or (self.current_step != TurnStep.UNTAP and permanent.untappable):
+                # Modify this to post triggers on untaps
+                permanent.untap()
+    
+    def _insert_step(self, steps: List[TurnStep], StepType: TurnStep, index: int):
+        steps.insert(index + 1, StepType)
+    
+    def _insert_phase(self, phases: List[TurnPhase], PhaseType: TurnPhase, index: int):
+        phases.insert(index + 1, PhaseType)
+
+
+    def _set_turn_order(self):
+        random.shuffle(self.players)
+        print(f"Turn order: {' - '.join(player.name for player in self.players)}")
+    
+    def _loop_priority(self, actions: List[List[Any]]):
+        active_player = self.active_player_index
+        num_players = self.num_players
+
+        for i in range(active_player, active_player + num_players):
+            current_player = self.players[i % num_players] # Loop through each player starting with active player
+            for item in actions: # Loop through each method / action we want them to take
+                action = item[0]
+                if len(item) > 1:
+                    params = item[1]
+                else:
+                    params = {}
+
+                action(current_player, **params) # Execute
+                        
     def create_permanent_from_card(self, card: Card, controller: 'Player') -> Permanent:
         new_permanent = Permanent(card, self)
         new_permanent.owner = card.owner
@@ -702,46 +901,6 @@ class GameState:
     
     def destroy_permanent(self, permanent: Permanent):
         permanent.controller.battlefield.remove(permanent)
-    
-    def change_zone(self, card: Card, new_zone: Zone, new_controller: Player) -> Zone:
-        old_zone = card.zone
-        controller = card.controller
-        owner = card.owner
-
-        if old_zone == new_zone:
-            return None
-
-        if old_zone == Zone.COMMAND:
-            controller.command_zone.remove(card)
-        elif old_zone == Zone.EXILE:
-            controller.exile.remove(card)
-        elif old_zone == Zone.GRAVEYARD:
-            controller.graveyard.remove(card)
-        elif old_zone == Zone.HAND:
-            controller.hand.remove(card)
-        elif old_zone == Zone.LIBRARY:
-            controller.library.remove(card)
-        elif old_zone == Zone.BATTLEFIELD:
-            controller.limbo.remove(card)
-        elif old_zone == Zone.STACK:
-            controller.limbo.remove(card)
-        
-        if new_zone == Zone.COMMAND:
-            new_controller.command_zone.append(card)
-        elif new_zone == Zone.EXILE:
-            new_controller.exile.append(card)
-        elif new_zone == Zone.GRAVEYARD:
-            new_controller.graveyard.append(card) 
-        elif new_zone == Zone.HAND:
-            new_controller.hand.append(card)
-        elif new_zone == Zone.LIBRARY:
-            new_controller.library.append(card)
-        elif new_zone == Zone.BATTLEFIELD:
-            new_controller.limbo.append(card)
-        elif new_zone == Zone.STACK:
-            new_controller.limbo.append(card)
-
-        card.zone = new_zone
 
     def get_characteristics(self, permanent: Permanent) -> Characteristics:
         chars = Characteristics(permanent)
@@ -875,4 +1034,6 @@ class GameState:
             expired_mods = [m for m in self.active_modifiers if m.duration == Duration.UNTIL_END_OF_TURN]
             for mod in expired_mods:
                 self.active_modifiers.remove(mod)
+
+
 
