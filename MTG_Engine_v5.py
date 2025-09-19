@@ -1,7 +1,9 @@
 import re
 import uuid
 import random
+import math
 import pandas as pd
+import operator
 from typing import List, Dict, Optional, Any, Set, Callable, Union
 from enum import Enum, auto
 
@@ -18,11 +20,11 @@ class TurnPhase(Enum):
 class TurnStep(Enum):
     UNTAP, UPKEEP, DRAW, MAIN, BEGINNING_OF_COMBAT, DECLARE_ATTACKERS, DECLARE_BLOCKERS, FIRST_STRIKE_DAMAGE, COMBAT_DAMAGE, END_OF_COMBAT, END, CLEANUP = auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto()
 
-class TriggerType(Enum):
-    DAMAGE_DEALT, ENTERS_THE_BATTLEFIELD, DIES, ZONE_CHANGE, DESTROYED, SACRIFICED, DRAW_CARD, UNTAP = auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto()
+class Event(Enum):
+    DEAL_DAMAGE, ZONE_CHANGE, DESTROY, SACRIFICE, DRAW_CARD, UNTAP, MILL_CARD = auto(), auto(), auto(), auto(), auto(), auto(), auto(), auto()
 
 class ReplacementType(Enum):
-    QUANTITY_MODIFICATION, ZONE_REDIRECT, SKIP = auto(), auto(), auto()
+    QUANTITY_MODIFICATION, ZONE_REDIRECT, SKIP, ACTION_CHANGE = auto(), auto(), auto()
 
 class CheckCondition(Enum):
     COLOR, TYPE = auto(), auto()
@@ -35,6 +37,12 @@ class ActionType(Enum):
 
 class Speed(Enum):
     SORCERY, INSTANT = auto(), auto()
+
+class RoundingType(Enum):
+    UP, DOWN, NONE = auto(), auto(), auto()
+
+class Comparator(Enum):
+    LESS_THAN, GREATER_THAN, EQUAL, NOT_EQUAL = operator.lt, operator.gt, operator.eq, operator.ne
 
 class Layer(Enum):
     COPY_EFFECTS = 1
@@ -66,7 +74,7 @@ def parse_mana_cost(cost_string: str) -> Dict[str, int]:
         elif s in cost: cost[s] += 1
     return {k: v for k, v in cost.items() if v > 0}
 
-def change_zone(card: 'Card', new_zone: Zone, index: int, new_controller: 'Player') -> Zone:
+def change_zone(card: 'Card', new_zone: Zone, index: int, new_controller: 'Player'):
     old_zone = card.zone
     controller = card.controller
 
@@ -101,6 +109,32 @@ def condition_check(card: 'Card', condition: CheckCondition, checks: Set[Any]):
                 return checks.isdisjoint(set(card.colorIdentity))
             case CheckCondition.TYPE:
                 return any(checks.isdisjoint(set(card.types)), checks.isdisjoint(set(card.subtypes)), checks.isdisjoint(set(card.supertypes)))
+
+def quantity_multiplier(num: float, multiplier: float, rounding_type: RoundingType = RoundingType.NONE, minimum: int = None, maximum: int = None):
+    num *= multiplier
+
+    if minimum:
+        num = max(num,minimum)
+    if maximum:
+        num = min(num,maximum)
+    
+    match rounding_type:
+        case RoundingType.UP:
+            return math.ceil(num)
+        case RoundingType.DOWN:
+            return math.floor(num)
+        case RoundingType.NONE:
+            return num
+        
+def quantity_addition(num: int, addition: int, minimum: int = None, maximum: int = None):
+    num += addition
+
+    if minimum:
+        num = max(num,minimum)
+    if maximum:
+        num = min(num,maximum)
+    
+    return num
 
 
 # ==============================================================================
@@ -338,6 +372,7 @@ class Player:
         self.alive = True
         self.life = 40
         self.max_hand_size = 7
+        self.lands_playable = 1 # Keep track of how many lands someone can play a turn
         self.hand: List['Card'] = []
         self.library: List['Card'] = []
         self.graveyard: List['Card'] = []
@@ -347,7 +382,6 @@ class Player:
         self.command_zone: List['Card'] = []
         self.commander_cast_count = 0
         self.commander_damage: Dict[str, int] = {}
-        self.land_played_this_turn = False
         self.deck = deck
         self.mana_pool = manaPool()
 
@@ -355,7 +389,8 @@ class Player:
         self.library = deck.library
         self.index: int = -1
         self.mulligan_count: int = 0
-        self.cards_drawn_this_turn = 0
+        self.cards_drawn_this_turn = 0 # Remember to reset at turn end
+        self.lands_played_this_turn = 0 # Remember to reset at turn end
 
         self.command_zone.append(self.commander)
 
@@ -430,95 +465,29 @@ class Player:
 
 class Stack:
     def __init__(self):
-        self._stack: List[Stackable] = []
+        self._stack: List['Card'] = []
 
-    def add(self, item: 'Stackable', player: 'Player'):
+    def add(self, item: 'Card', player: 'Player'):
         item.owner = player
         item.controller = player
         print(f"  [STACK] {player.name} puts {item} on the stack.")
         self._stack.append(item)
 
-    def remove(self, item: 'Stackable') -> 'Stackable':
+    def remove(self, item: 'Card'):
         self._stack.remove(item)
-        return item
 
     def resolve(self, game_state: 'GameState'):
         return self._stack.pop().resolve(game_state) if self._stack else None
 
     def is_empty(self) -> bool:
         return not self._stack
-    
+
 class ReplacementEffect:
-    def __init__(self, event: GameEvent)
-
-class GameEvent:
-    def __init__(self, event_type: TriggerType, **data):
-        self.type = event_type
-        self.data = data
-        self.is_replaced = False
-
-class ReplacementEffect_______OLD:
-    def __init__(self, original_event: TriggerType, new_event_type: TriggerType, conditions: List[Callable], description: str):
-        self.original_event_type = original_event
-        self.new_event_type = new_event_type
-        # Conditions are functions that check the event data, e.g., lambda event: "Creature" in event.data['target'].types
-        self.conditions = conditions
-        self.description = description
-
-    def check_conditions(self, event: GameEvent) -> bool:
-        """Checks if this replacement effect applies to the given event."""
-        if event.type != self.original_event_type:
-            return False
-        return all(cond(event) for cond in self.conditions)
-
-    def create_new_event(self, original_event: GameEvent) -> GameEvent:
-        """Creates the new event based on the original."""
-        # This logic would be more complex, transferring relevant data from old to new event
-        new_data = original_event.data.copy()
-        print(f"  [REPLACE] '{self.description}' is replacing {original_event.type.name} with {self.new_event_type.name}.")
-        return GameEvent(self.new_event_type, **new_data)
-
-class EventManager:
-    def __init__(self, game_state: 'GameState'):
-        self.game_state = game_state
-        self.registered_triggers: Dict[TriggerType, List[Callable]] = {}
-
-    def _get_applicable_replacements(self, event: GameEvent) -> List[ReplacementEffect]:
-        """Finds all active replacement effects that could apply to an event."""
-        effects = []
-        for modifier in self.game_state.active_modifiers:
-            if modifier.replacement_effect and modifier.replacement_effect.check_conditions(event):
-                effects.append(modifier.replacement_effect)
-        return effects
-
-    def post_event(self, trigger: TriggerType, **data):
-        """
-        The main event pipeline, with event replacement.
-        """
-        # 1. Check for and apply any replacement effects
-        applicable_replacements = self._get_applicable_replacements(event)
-
-        if applicable_replacements:
-            # If multiple replacements apply, the affected player chooses one.
-            # This requires a call to the InputHandler.
-            chosen_replacement = applicable_replacements[0] # Placeholder
-            
-            # The original event is replaced by a new one.
-            event = chosen_replacement.create_new_event(event)
-
-        # 2. The final event occurs. Now, check for triggered abilities for the NEW event.
-        if trigger in self.registered_triggers:
-            for triggered_ability in self.registered_triggers[trigger]:
-                if triggered_ability:
-                    self.game_state.pending_triggers.append(triggered_ability)
-                    print(f"  [EVENT] {event.type.name} caused '{triggered_ability.description}' to trigger.")
-
-    def register_trigger(self, trigger: TriggerType, triggered_ability: 'TriggeredAbility'):
-        self.registered_triggers[trigger].append(triggered_ability)
-
-    def deregister_trigger(self, trigger: TriggerType, triggered_ability: 'TriggeredAbility'):
-        self.registered_triggers[trigger].remove(triggered_ability)
-
+    def __init__(self, event: Event, replacement_type: ReplacementType, replacement_conditions: tuple[Comparator, Dict], modification: Any):
+        self.event = event
+        self.replacementType = replacement_type
+        self.replacementConditions = replacement_conditions
+        self.modification = modification # Could be a callable, could be the new zone to go to, etc
 
 class Modifier:
     def __init__(self, source, applies_to: Callable, effect: Callable, layer: Layer, duration: Duration = Duration.PERMANENT):
@@ -622,6 +591,22 @@ class Card(GameObject):
         self = self.otherFace
         self.otherFace = temp_card
 
+    def look(self):
+        print(f"Card name: {self.name}")
+        print(f"Mana cost: {self.manaCost}")
+        print(f"Color identity: {self.colorIdentity}")
+        print(f"Supertypes: {' '.join(card_type for card_type in self.supertypes)}")
+        print(f"Types: {' '.join(card_type for card_type in self.types)}")
+        print(f"Subtypes: {' '.join(card_type for card_type in self.subtypes)}")
+        print(f"Text: {self.text}")
+        print(f"Flavor text: {self.flavorText}")
+        if condition_check(self, CheckCondition.TYPE, set('Creature')):
+            print(f"Power: {self.power}")
+            print(f"Toughness: {self.toughness}")
+        if condition_check(self, CheckCondition.TYPE, set('Planeswalker')): # Need to look into sieges / sagas, etc. On another note, figure out how to display counters
+            print(f"Loyalty: {self.loyalty}")
+        print(f"Dual faced card: {self.is_dfc}")
+
     def _parse_text(self):
         # CONCEPTUAL: This is where a sophisticated rules parser would go.
         # It would read the text and create ReplacementEffect objects.
@@ -636,13 +621,6 @@ class Card(GameObject):
                 )
             ] """
         return {}
-
-class Characteristics:
-    def __init__(self, permanent: 'Permanent'):
-        self.power = int(permanent.source_card.printed_power or 0) if permanent.source_card.printed_power.isdigit() else 0
-        self.toughness = int(permanent.source_card.printed_toughness or 0) if permanent.source_card.printed_toughness.isdigit() else 0
-        self.keywords = set(permanent.source_card.keywords)
-        self.types = set(permanent.source_card.types)
 
 class Permanent(Card):
     def __init__(self, source_card: Card):
@@ -663,7 +641,7 @@ class Ability(GameObject):
         self.effect = effect
 
     def resolve(self, game_state: 'GameState'):
-        print(f"  [STACK] Resolving trigger: {self.description} from {self.source.name}")
+        print(f"  [STACK] Resolving ability: {self.description} from {self.source.name}")
         self.effect(self.source, game_state)
 
 class StaticAbility(Ability):
@@ -673,7 +651,11 @@ class ActivatedAbility(Ability):
     pass
 
 class TriggeredAbility(Ability):
-    pass
+    def __init__(self):
+        super.__init__()
+
+    def trigger(**params):
+        pass
     
 
 class Spell(Card):
