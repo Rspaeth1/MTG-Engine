@@ -42,7 +42,7 @@ class RoundingType(Enum):
     UP, DOWN, NONE = auto(), auto(), auto()
 
 class Comparator(Enum):
-    LESS_THAN, GREATER_THAN, EQUAL, NOT_EQUAL = operator.lt, operator.gt, operator.eq, operator.ne
+    LESS_THAN, GREATER_THAN, LESS_THAN_OR_EQUAL, GREATER_THAN_OR_EQUAL, EQUAL, NOT_EQUAL = operator.lt, operator.gt, operator.le, operator.ge, operator.eq, operator.ne
 
 class Layer(Enum):
     COPY_EFFECTS = 1
@@ -483,8 +483,9 @@ class Stack:
         return not self._stack
 
 class ReplacementEffect:
-    def __init__(self, event: Event, replacement_type: ReplacementType, replacement_conditions: tuple[Comparator, Dict], modification: Any):
+    def __init__(self, event: Event, replacement_type: ReplacementType, replacement_conditions: tuple[Comparator, Dict], modification: Any, new_event: Event = None):
         self.event = event
+        self.new_event = new_event
         self.replacementType = replacement_type
         self.replacementConditions = replacement_conditions
         self.modification = modification # Could be a callable, could be the new zone to go to, etc
